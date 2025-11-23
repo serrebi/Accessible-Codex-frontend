@@ -1,5 +1,5 @@
 # Accessible Codex Frontend (Windows & WSL)
-
+***this is abbandoned.
 Screen-reader-friendly desktop UI for running the Codex CLI on Windows or inside WSL. Focus areas:
 
 - **Windows-first, WSL-ready**: Uses the Windows Codex CLI by default and auto-detects WSL as an alternative backend (similar to picking an SSH target).
