@@ -96,15 +96,17 @@ def should_route_to_thinking(line: str) -> bool:
     if not clean:
         return False
     lower = clean.lower()
-    if "🌐" in clean and "search" in lower:
+    if lower.startswith("thinking") or lower.startswith("[thinking"):
+        return True
+    if lower.startswith("**"):
+        return True
+    if "??" in clean and "search" in lower:
         return True
     if "searched:" in lower or "search query:" in lower:
         return True
     if lower.endswith(" codex") or lower == "codex":
         return True
     return False
-
-
 def should_hide_from_output(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
@@ -155,3 +157,4 @@ def normalize_thinking_text(text: str) -> str:
             stripped = "finished!"
         return stripped
     return "\n".join(lines)
+

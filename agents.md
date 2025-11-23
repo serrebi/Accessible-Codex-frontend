@@ -1,6 +1,6 @@
 # Codex Frontend Documentation Index
 
-Use these focused notes to jump directly to the area you need without loading the entire description into a single buffer.
+Use these focused notes to jump directly to the area you need without loading the entire description into a single buffer. Keep it short, blunt, and future-proof for Codex/AI maintenance.
 
 - [Overview](docs/agents/overview.md)
 - [User Interface](docs/agents/ui.md)
@@ -11,5 +11,8 @@ Use these focused notes to jump directly to the area you need without loading th
 - [Security Notes](docs/agents/security.md)
 - [Testing Helpers](docs/agents/testing.md)
 - [Recent Changes](docs/agents/changelog.md)
+- [Sessions & Persistence](docs/agents/overview.md#sessions)
+- [Platforms](docs/agents/overview.md#platforms-windows-wsl)
+- [Models & Reasoning](docs/agents/configuration.md#models-and-reasoning)
 
 Each file mirrors the latest knowledge captured in the monolithic document while making targeted edits faster and cheaper in terms of tokens. Update the relevant file(s) when behavior changes, and adjust this index if you add new topics.

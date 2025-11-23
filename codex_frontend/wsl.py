@@ -12,6 +12,23 @@ def bash_single_quote(text: str) -> str:
     return "'" + text.replace("'", "'\"'\"'") + "'"
 
 
+def available() -> bool:
+    try:
+        cp = subprocess.run(
+            ["wsl.exe", "-e", "bash", "-lc", "echo WSL_OK"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        return cp.returncode == 0 and "WSL_OK" in (cp.stdout or "")
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
 def run_wsl_bash(script: str, input_text: Optional[str] = None, timeout: Optional[int] = None) -> RunResult:
     args = ["wsl.exe", "-e", "bash", "-lc", script]
     try:
@@ -34,7 +51,7 @@ def run_wsl_bash(script: str, input_text: Optional[str] = None, timeout: Optiona
 
 
 def run_wsl_root_user(cmd: str, timeout: Optional[int] = None) -> RunResult:
-    env_prefix = "env NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb"
+    env_prefix = "export NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb;"
     inner = f"{env_prefix} {cmd}"
     script = f"bash -lc {bash_single_quote(inner)}"
     args = ["wsl.exe", "-u", "root", "-e", "bash", "-lc", script]
@@ -53,8 +70,8 @@ def run_wsl_root_user(cmd: str, timeout: Optional[int] = None) -> RunResult:
 
 
 def run_wsl_sudo(cmd: str, password: str, timeout: Optional[int] = None) -> RunResult:
-    env_prefix = "env NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb"
-    inner = f"sudo -S -p '' sh -lc {bash_single_quote(env_prefix + ' ' + cmd)}"
+    env_prefix = "export NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb;"
+    inner = f"sudo -S -p '' bash -lc {bash_single_quote(env_prefix + ' ' + cmd)}"
     return run_wsl_bash(inner, input_text=password + "\n", timeout=timeout)
 
 
@@ -169,7 +186,7 @@ def stream_wsl_root_user(
     stdout_cb: Optional[Callable[[str], None]],
     stderr_cb: Optional[Callable[[str], None]],
 ) -> RunResult:
-    env_prefix = "env NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb"
+    env_prefix = "export NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb;"
     inner = f"{env_prefix} {cmd}"
     script = f"bash -lc {bash_single_quote(inner)}"
     args = ["wsl.exe", "-u", "root", "-e", "bash", "-lc", script]
@@ -183,8 +200,8 @@ def stream_wsl_sudo(
     stdout_cb: Optional[Callable[[str], None]],
     stderr_cb: Optional[Callable[[str], None]],
 ) -> RunResult:
-    env_prefix = "env NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb"
-    inner = f"sudo -S -p '' sh -lc {bash_single_quote(env_prefix + ' ' + cmd)}"
+    env_prefix = "export NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb;"
+    inner = f"sudo -S -p '' bash -lc {bash_single_quote(env_prefix + ' ' + cmd)}"
     return stream_wsl_bash(inner, input_text=password + "\n", timeout=timeout, stdout_cb=stdout_cb, stderr_cb=stderr_cb)
 
 

@@ -19,3 +19,14 @@ The Codex Frontend is a wxPython desktop application for Windows that drives the
 - The worker captures stdout/stderr streams line-by-line, updates UI panes, appends to conversation files, and manages Codex session IDs for resume support.
 
 See the other documents in this folder for deeper dives on UI behavior, configuration, metrics, security considerations, and testing support.
+
+## Sessions
+- Conversation history and MCP-style session logs are read from the user-scoped Windows path `%USERPROFILE%\\.codex\\sessions` by default. This is mirrored into WSL when needed so the same files open regardless of host.
+- The history panel and “Change Conversation Directory…” menu let users point to any writable folder; paths are normalized to work on either Windows or WSL.
+- Token and stderr noise is suppressed in the conversation log to keep session files readable for screen reader users.
+
+## Platforms (Windows / WSL)
+- The frontend now prefers the native Windows Codex CLI if present on `PATH`, and will auto-install or update it from the official GitHub releases on launch (including alpha/beta builds).
+- WSL remains available as a selectable backend, automatically detected and offered similarly to an SSH target; users can switch via the connection dialog.
+- First-run prompts guide the user through Codex authentication either in a browser (ChatGPT) or by providing an API key via the CLI, both exposed in an accessible combo box.
+- All filesystem operations are resilient to Windows vs. WSL path separators; stored paths are canonicalized before use.

@@ -9,7 +9,7 @@ import paramiko
 
 from .run_result import RunResult
 
-ENV_PREFIX = "env NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb"
+ENV_PREFIX = "export NO_COLOR=1 CLICOLOR=0 CI=1 TERM=dumb;"
 
 
 def bash_single_quote(text: str) -> str:
@@ -27,6 +27,28 @@ class SSHBackend:
 
     def description(self) -> str:
         return f"Remote SSH {self.username}@{self.host}:{self.port}"
+
+    def detect_os(self) -> str:
+        res = self.run_shell("grep -E '^(PRETTY_NAME|NAME)=' /etc/os-release || uname -s", None, 5)
+        if not res.ok:
+            return "Unknown Linux"
+        
+        text = res.stdout.strip()
+        if "PRETTY_NAME=" in text:
+            for line in text.splitlines():
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip('"')
+        if "NAME=" in text:
+             for line in text.splitlines():
+                if line.startswith("NAME="):
+                    return line.split("=", 1)[1].strip('"')
+        return text or "Unknown Linux"
+
+    def detect_arch(self) -> str:
+        res = self.run_shell("uname -m", None, 5)
+        if not res.ok:
+            return "unknown"
+        return res.stdout.strip()
 
     def _ensure_client(self) -> paramiko.SSHClient:
         with self._lock:
@@ -64,19 +86,32 @@ class SSHBackend:
         cmd = f"bash -lc {bash_single_quote(script)}"
         return self._exec_command(cmd, input_text, timeout)
 
-    def run_as_root(self, cmd: str, timeout: Optional[int]) -> RunResult:
+    def run_as_root(self, cmd: str, password: Optional[str], timeout: Optional[int]) -> RunResult:
+        if password:
+            # Use sudo -S to read password from stdin
+            wrapped = f"sudo -S -p '' bash -lc {bash_single_quote(f'{ENV_PREFIX} {cmd}')}"
+            return self._exec_command(wrapped, input_text=password + "\n", timeout=timeout)
+        
         wrapped = f"bash -lc {bash_single_quote(f'{ENV_PREFIX} {cmd}')}"
         return self._exec_command(wrapped, None, timeout)
 
     def stream_as_root(
         self,
         cmd: str,
+        password: Optional[str],
         timeout: Optional[int],
         stdout_cb: Optional[Callable[[str], None]],
         stderr_cb: Optional[Callable[[str], None]],
     ) -> RunResult:
+        if password:
+            wrapped = f"sudo -S -p '' bash -lc {bash_single_quote(f'{ENV_PREFIX} {cmd}')}"
+            # We need to write password to stdin. _stream_command doesn't support input_text yet.
+            # We'll need to modify _stream_command or handle it here.
+            # Modifying _stream_command is cleaner.
+            return self._stream_command(wrapped, password + "\n", timeout, stdout_cb, stderr_cb)
+
         wrapped = f"bash -lc {bash_single_quote(f'{ENV_PREFIX} {cmd}')}"
-        return self._stream_command(wrapped, timeout, stdout_cb, stderr_cb)
+        return self._stream_command(wrapped, None, timeout, stdout_cb, stderr_cb)
 
     def _exec_command(
         self,
@@ -84,69 +119,97 @@ class SSHBackend:
         input_text: Optional[str],
         timeout: Optional[int],
     ) -> RunResult:
-        client = self._ensure_client()
-        stdin, stdout, stderr = client.exec_command(command)
-        channel = stdout.channel
-        if input_text:
-            stdin.write(input_text)
-            if not input_text.endswith("\n"):
-                stdin.write("\n")
-            stdin.flush()
-        stdin.close()
+        try:
+            client = self._ensure_client()
+            stdin, stdout, stderr = client.exec_command(command)
+            channel = stdout.channel
+            
+            # Force binary mode
+            for stream in (stdout, stderr):
+                if hasattr(stream, "_set_mode"):
+                    stream._set_mode("b")
 
-        timed_out, exit_status = self._wait_for_exit(channel, timeout)
-        stdout_text = stdout.read().decode("utf-8", errors="replace")
-        stderr_text = stderr.read().decode("utf-8", errors="replace")
-        if timed_out:
-            exit_status = 124
-        ok = exit_status == 0
-        if timed_out and not stderr_text:
-            stderr_text = f"Timeout after {timeout or 0} seconds"
-        return RunResult(ok, exit_status, stdout_text, stderr_text)
+            if input_text:
+                stdin.write(input_text)
+                if not input_text.endswith("\n"):
+                    stdin.write("\n")
+                stdin.flush()
+            stdin.close()
+
+            timed_out, exit_status = self._wait_for_exit(channel, timeout)
+            # Decode with replace to handle binary/garbage output safely
+            stdout_text = stdout.read().decode("utf-8", errors="replace")
+            stderr_text = stderr.read().decode("utf-8", errors="replace")
+            if timed_out:
+                exit_status = 124
+            ok = exit_status == 0
+            if timed_out and not stderr_text:
+                stderr_text = f"Timeout after {timeout or 0} seconds"
+            return RunResult(ok, exit_status, stdout_text, stderr_text)
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            return RunResult(False, 255, "", f"SSH Error: {exc}")
 
     def _stream_command(
         self,
         command: str,
+        input_text: Optional[str],
         timeout: Optional[int],
         stdout_cb: Optional[Callable[[str], None]],
         stderr_cb: Optional[Callable[[str], None]],
     ) -> RunResult:
-        client = self._ensure_client()
-        stdin, stdout, stderr = client.exec_command(command)
-        channel = stdout.channel
-        stdin.close()
+        try:
+            client = self._ensure_client()
+            stdin, stdout, stderr = client.exec_command(command)
+            channel = stdout.channel
 
-        stdout_chunks: List[str] = []
-        stderr_chunks: List[str] = []
+            # Force binary mode to prevent Paramiko from crashing on non-UTF8 bytes
+            for stream in (stdout, stderr):
+                if hasattr(stream, "_set_mode"):
+                    stream._set_mode("b")
+            
+            if input_text:
+                stdin.write(input_text)
+                if not input_text.endswith("\n"):
+                    stdin.write("\n")
+                stdin.flush()
+            stdin.close()
 
-        def _consume(stream, chunks: List[str], callback: Optional[Callable[[str], None]]):
-            while True:
-                line = stream.readline()
-                if not line:
-                    break
-                if isinstance(line, bytes):
-                    line = line.decode("utf-8", errors="replace")
-                chunks.append(line)
-                if callback:
-                    callback(line)
+            stdout_chunks: List[str] = []
+            stderr_chunks: List[str] = []
 
-        threads: List[threading.Thread] = []
-        t_out = threading.Thread(target=_consume, args=(stdout, stdout_chunks, stdout_cb), daemon=True)
-        t_err = threading.Thread(target=_consume, args=(stderr, stderr_chunks, stderr_cb), daemon=True)
-        t_out.start()
-        t_err.start()
-        threads.extend([t_out, t_err])
+            def _consume(stream, chunks: List[str], callback: Optional[Callable[[str], None]]):
+                while True:
+                    try:
+                        line = stream.readline()
+                    except Exception:
+                        break
+                    if not line:
+                        break
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8", errors="replace")
+                    chunks.append(line)
+                    if callback:
+                        callback(line)
 
-        timed_out, exit_status = self._wait_for_exit(channel, timeout)
+            threads: List[threading.Thread] = []
+            t_out = threading.Thread(target=_consume, args=(stdout, stdout_chunks, stdout_cb), daemon=True)
+            t_err = threading.Thread(target=_consume, args=(stderr, stderr_chunks, stderr_cb), daemon=True)
+            t_out.start()
+            t_err.start()
+            threads.extend([t_out, t_err])
 
-        for t in threads:
-            t.join()
+            timed_out, exit_status = self._wait_for_exit(channel, timeout)
 
-        stdout_text = "".join(stdout_chunks)
-        stderr_text = "".join(stderr_chunks)
-        if timed_out:
-            exit_status = 124
-        ok = exit_status == 0
-        if timed_out and not stderr_text:
-            stderr_text = f"Timeout after {timeout or 0} seconds"
-        return RunResult(ok, exit_status, stdout_text, stderr_text)
+            for t in threads:
+                t.join()
+
+            stdout_text = "".join(stdout_chunks)
+            stderr_text = "".join(stderr_chunks)
+            if timed_out:
+                exit_status = 124
+            ok = exit_status == 0
+            if timed_out and not stderr_text:
+                stderr_text = f"Timeout after {timeout or 0} seconds"
+            return RunResult(ok, exit_status, stdout_text, stderr_text)
+        except (paramiko.SSHException, EOFError, OSError) as exc:
+            return RunResult(False, 255, "", f"SSH Error: {exc}")

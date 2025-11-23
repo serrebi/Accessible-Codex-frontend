@@ -1,17 +1,27 @@
 """Main wxPython frame for the Codex frontend."""
 from __future__ import annotations
 
-import os
 import re
 from typing import List, Optional
+from pathlib import Path
 
 import wx
 
 from . import backend, local_conf, settings
 from .connection_dialog import ConnectionDialog
 from .parsing import normalize_thinking_text
-from .ui_panels import HistoryPanel, OptionsDialog, RunLogDialog
+from .ui_panels import HistoryPanel, OptionsDialog, RunLogDialog, AuthDialog
 from .worker import Worker
+
+
+class NoFocusPanel(wx.Panel):
+    """Panel that refuses keyboard focus to stay out of tab order."""
+
+    def AcceptsFocus(self) -> bool:  # pragma: no cover - GUI focus control
+        return False
+
+    def AcceptsFocusFromKeyboard(self) -> bool:  # pragma: no cover - GUI focus control
+        return False
 
 
 class MainFrame(wx.Frame):
@@ -27,12 +37,19 @@ class MainFrame(wx.Frame):
         self.token_budget: int = settings.DEFAULT_CONVERSATION_TOKEN_BUDGET
         self.tokens_remaining: Optional[int] = self.token_budget
         self.thinking_history: List[str] = []
+        self.live_activity_raw: List[str] = []
+        self.live_activity_calllater = None
         self.conversation_log_lines: List[str] = []
         self.options_dialog: Optional[OptionsDialog] = None
         self.current_run_log_chunks: List[str] = []
         self.last_run_log: str = ""
+        self.status_footer: str = ""
+        self.show_tokens: bool = False
+        self.show_thinking: bool = True
         self.connection_mode: str = "local"
+        self.remote_password: Optional[str] = None  # Track remote sudo/SSH password for worker tasks
         self.worker: Optional[Worker] = None
+        self.conversation_has_been_labeled: bool = False # New flag
 
         splitter = wx.SplitterWindow(self)
         splitter.SetMinimumPaneSize(200)
@@ -45,97 +62,150 @@ class MainFrame(wx.Frame):
         frame_sizer.Add(splitter, 1, wx.EXPAND)
         self.SetSizer(frame_sizer)
 
-        panel = self.chat_panel
-        pwd_lbl = wx.StaticText(panel, label="Password for sudo:")
+        # Main Right Panel Layout
+        main_layout = wx.BoxSizer(wx.VERTICAL)
+        
+        # Top Controls (Password & Help)
+        top_controls_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        self.help_lbl = wx.StaticText(
+            self.chat_panel,
+            label="Tip: Ctrl+S starts the pipeline, Ctrl+R sends the prompt, Ctrl+L opens the run log.",
+        )
+        self.help_lbl.SetName("Shortcut help")
+        top_controls_sizer.Add(self.help_lbl, 0, wx.EXPAND | wx.ALL, 6)
+
+        pwd_lbl = wx.StaticText(self.chat_panel, label="Password for sudo:")
         pwd_lbl.SetName("Password label")
-        self.pwd_tc = wx.TextCtrl(panel, style=wx.TE_PASSWORD | wx.TE_PROCESS_ENTER)
+        self.pwd_tc = wx.TextCtrl(self.chat_panel, style=wx.TE_PASSWORD | wx.TE_PROCESS_ENTER)
         self.pwd_tc.SetName("Password input")
-
-        self.save_pw_cb = wx.CheckBox(panel, label="Save password to conf file")
+        self.save_pw_cb = wx.CheckBox(self.chat_panel, label="Save password to conf file")
         self.save_pw_cb.SetName("Save password checkbox")
-
-        self.start_btn = wx.Button(panel, label="&Start pipeline")
-        self.start_btn.SetName("Start pipeline button")
-        self.stop_btn = wx.Button(panel, label="S&top worker")
-        self.stop_btn.SetName("Stop worker button")
-
-        task_lbl_title = wx.StaticText(panel, label="Current task:")
-        task_lbl_title.SetName("Current task label")
-        self.task_lbl = wx.StaticText(panel, label="Idle")
-        self.task_lbl.SetName("Task value label")
-
-        out_lbl = wx.StaticText(panel, label="Conversation log:")
-        out_lbl.SetName("Output label")
-        self.output_tc = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
-        self.output_tc.SetName("Output log")
-        self.token_metrics_lbl = wx.StaticText(panel, label="Tokens used: 0   Remaining: 0 (0.0% left)")
-        self.token_metrics_lbl.SetName("Token metrics")
-        thinking_lbl = wx.StaticText(panel, label="Thinking / telemetry:")
-        thinking_lbl.SetName("Thinking label")
-        self.thinking_tc = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
-        self.thinking_tc.SetName("Thinking log")
-
-        prompt_lbl = wx.StaticText(panel, label="Prompt:")
-        prompt_lbl.SetName("Prompt label")
-        self.cmd_tc = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
-        self.cmd_tc.SetName("Prompt input")
-        self.run_cmd_btn = wx.Button(panel, label="&Send prompt")
-        self.run_cmd_btn.SetName("Run prompt button")
-
-        self.copy_log_btn = wx.Button(panel, label="Copy &output")
-        self.copy_log_btn.SetName("Copy output button")
-        self.view_run_log_btn = wx.Button(panel, label="View &run log")
-        self.view_run_log_btn.SetName("View run log button")
-        self.new_conversation_btn = wx.Button(panel, label="&New conversation")
-        self.new_conversation_btn.SetName("New conversation button")
-        self.options_btn = wx.Button(panel, label="&Options…")
-        self.options_btn.SetName("Options button")
-
+        
         pwd_row = wx.BoxSizer(wx.HORIZONTAL)
         pwd_row.Add(pwd_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         pwd_row.Add(self.pwd_tc, 1, wx.ALIGN_CENTER_VERTICAL)
         pwd_row.Add(self.save_pw_cb, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 8)
+        top_controls_sizer.Add(pwd_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        
+        # Buttons (Start/Stop/New)
+        self.start_btn = wx.Button(self.chat_panel, label="&Start pipeline")
+        self.start_btn.SetName("Start pipeline button")
+        self.stop_btn = wx.Button(self.chat_panel, label="S&top worker")
+        self.stop_btn.SetName("Stop worker button")
+        self.start_btn.Hide() # Keep hidden as per original
+        self.stop_btn.Hide()
+
+        self.new_conversation_btn = wx.Button(self.chat_panel, label="&New conversation")
+        self.new_conversation_btn.SetName("New conversation button")
+        self.options_btn = wx.Button(self.chat_panel, label="&Options…")
+        self.options_btn.SetName("Options button")
+        self.options_btn.Hide()
+
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        btn_row.Add(self.new_conversation_btn, 0, wx.RIGHT, 6)
+        top_controls_sizer.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        main_layout.Add(top_controls_sizer, 0, wx.EXPAND)
+
+        # Task Status
+        task_row = wx.BoxSizer(wx.HORIZONTAL)
+        task_lbl_title = wx.StaticText(self.chat_panel, label="Current task:")
+        task_lbl_title.SetName("Current task label")
+        self.task_lbl = wx.StaticText(self.chat_panel, label="Idle")
+        self.task_lbl.SetName("Task value label")
+        task_row.Add(task_lbl_title, 0, wx.RIGHT, 6)
+        task_row.Add(self.task_lbl, 1, wx.EXPAND)
+        main_layout.Add(task_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        # Notebook for Chat and Thinking
+        self.notebook = wx.Notebook(self.chat_panel)
+        
+        # Tab 1: Chat
+        self.chat_tab = wx.Panel(self.notebook)
+        chat_tab_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.output_tc = wx.TextCtrl(self.chat_tab, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
+        self.output_tc.SetName("Output log")
+        chat_tab_sizer.Add(self.output_tc, 1, wx.EXPAND | wx.ALL, 6)
+        self.chat_tab.SetSizer(chat_tab_sizer)
+        
+        # Tab 2: Thinking
+        self.thinking_tab = wx.Panel(self.notebook)
+        thinking_tab_sizer = wx.BoxSizer(wx.VERTICAL)
+        # Use plain, non-rich edit controls to keep screen readers stable
+        self.thinking_tc = wx.TextCtrl(
+            self.thinking_tab,
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP,
+        )
+        self.thinking_tc.SetName("Thinking log")
+        self.live_activity_lbl = wx.StaticText(self.thinking_tab, label="Live output (raw stdout/stderr):")
+        self.live_activity_lbl.SetName("Live activity label")
+        # Live output shows latest lines (plain, multiline) but we throttle updates for SR stability
+        self.live_activity_tc = wx.TextCtrl(
+            self.thinking_tab,
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP,
+        )
+        self.live_activity_tc.SetName("Live activity output")
+
+        thinking_tab_sizer.Add(self.thinking_tc, 1, wx.EXPAND | wx.ALL, 6)
+        thinking_tab_sizer.Add(self.live_activity_lbl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+        thinking_tab_sizer.Add(self.live_activity_tc, 1, wx.EXPAND | wx.ALL, 6)
+        self.thinking_tab.SetSizer(thinking_tab_sizer)
+
+        self.notebook.AddPage(self.chat_tab, "Chat")
+        self.notebook.AddPage(self.thinking_tab, "Thinking")
+        
+        main_layout.Add(self.notebook, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
+
+        # Bottom Controls (Prompt)
+        bottom_controls_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Token Metrics (Placeholder for insertion)
+        self.token_metrics_insert_index = main_layout.GetItemCount() - 1 # Insert before notebook? No, inside main layout? 
+        # Let's handle token metrics differently. We'll add a placeholder sizer item in main_layout
+        # Or we can just add it to bottom_controls_sizer.
+        
+        prompt_lbl = wx.StaticText(self.chat_panel, label="Prompt:")
+        prompt_lbl.SetName("Prompt label")
+        self.cmd_tc = wx.TextCtrl(self.chat_panel, style=wx.TE_PROCESS_ENTER)
+        self.cmd_tc.SetName("Prompt input")
+        self.run_cmd_btn = wx.Button(self.chat_panel, label="&Send prompt")
+        self.run_cmd_btn.SetName("Run prompt button")
 
         cmd_row = wx.BoxSizer(wx.HORIZONTAL)
         cmd_row.Add(self.cmd_tc, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         cmd_row.Add(self.run_cmd_btn, 0)
 
-        btn_row = wx.BoxSizer(wx.HORIZONTAL)
-        btn_row.Add(self.start_btn, 0, wx.RIGHT, 6)
-        btn_row.Add(self.stop_btn, 0, wx.RIGHT, 6)
-        btn_row.Add(self.new_conversation_btn, 0, wx.RIGHT, 6)
-        btn_row.Add(self.copy_log_btn, 0, wx.RIGHT, 6)
-        btn_row.Add(self.view_run_log_btn, 0, wx.RIGHT, 6)
-        btn_row.Add(self.options_btn, 0)
+        bottom_controls_sizer.Add(prompt_lbl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+        bottom_controls_sizer.Add(cmd_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        
+        main_layout.Add(bottom_controls_sizer, 0, wx.EXPAND)
+        
+        self.chat_panel.SetSizer(main_layout)
 
-        layout = wx.BoxSizer(wx.VERTICAL)
-        layout.Add(pwd_row, 0, wx.EXPAND | wx.ALL, 6)
-        layout.Add(btn_row, 0, wx.EXPAND | wx.ALL, 6)
-        layout.Add(task_lbl_title, 0, wx.LEFT | wx.RIGHT, 6)
-        layout.Add(self.task_lbl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
-        layout.Add(out_lbl, 0, wx.LEFT | wx.RIGHT, 6)
-        layout.Add(self.output_tc, 3, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
-        layout.Add(self.token_metrics_lbl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
-        layout.Add(thinking_lbl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
-        layout.Add(self.thinking_tc, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
-        layout.Add(prompt_lbl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
-        layout.Add(cmd_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
-        panel.SetSizer(layout)
+        # Metrics handling needs adjustment since layout changed
+        self.token_metrics_panel = None
+        self.token_metrics_lbl = None
+        self.token_metrics_in_layout = False
+        self.token_metrics_sizer_item = None # Not used in new logic directly
+        
+        # Thinking controls used for visibility toggling (legacy ref)
+        self.thinking_controls = [self.thinking_tab] # We will show/hide the page or tab
 
+        self._apply_accessibility_defaults()
         self.password_widgets = [pwd_lbl, self.pwd_tc, self.save_pw_cb]
         self.password_controls_visible = True
 
         self._initialize_connection()
 
         self._build_menus()
+        self._apply_visibility_defaults()
 
         self.start_btn.Bind(wx.EVT_BUTTON, self.on_start)
         self.stop_btn.Bind(wx.EVT_BUTTON, self.on_stop)
         self.run_cmd_btn.Bind(wx.EVT_BUTTON, self.on_run_cmd)
         self.cmd_tc.Bind(wx.EVT_TEXT_ENTER, self.on_run_cmd)
         self.pwd_tc.Bind(wx.EVT_TEXT_ENTER, self.on_start)
-        self.copy_log_btn.Bind(wx.EVT_BUTTON, self.on_copy_log)
-        self.view_run_log_btn.Bind(wx.EVT_BUTTON, self.on_view_run_log)
         self.new_conversation_btn.Bind(wx.EVT_BUTTON, self.on_new_conversation)
         self.options_btn.Bind(wx.EVT_BUTTON, self.on_open_options)
 
@@ -149,13 +219,16 @@ class MainFrame(wx.Frame):
             (wx.ACCEL_CTRL, ord("H"), int(self.menu_id_refresh_history)),
             (wx.ACCEL_CTRL, ord("O"), int(self.menu_id_options)),
             (wx.ACCEL_CTRL, ord("N"), int(self.menu_id_new_conversation)),
-            (wx.ACCEL_CTRL, ord("L"), self.view_run_log_btn.GetId()),
         ]
         self.SetAcceleratorTable(wx.AcceleratorTable(entries))
 
         self.restart_worker()
 
+        # Ensure conversation dir matches the initial model/connection state
+        self.worker.q.put({"action": "update_conversation_directory", "password": self.get_password()})
+
         self.auto_start_scheduled = False
+        self.auto_update_codex = settings.DEFAULT_AUTO_UPDATE_CODEX
 
         self.load_saved_password()
         self.update_password_visibility()
@@ -166,6 +239,31 @@ class MainFrame(wx.Frame):
         self.schedule_history_refresh()
 
     # Menu ---------------------------------------------------------
+
+    def _apply_accessibility_defaults(self) -> None:
+        """Apply small UI tweaks that make text easier to digest quickly."""
+        mono = wx.Font(11, wx.FONTFAMILY_MODERN, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+        for ctrl in (self.output_tc, self.thinking_tc):
+            try:
+                ctrl.SetFont(mono)
+            except Exception:
+                pass
+        self.cmd_tc.SetHint("Type a prompt and press Enter or Ctrl+R")
+        self.pwd_tc.SetHint("WSL sudo password (optional)")
+        self.help_lbl.Wrap(880)
+        if self.token_metrics_lbl:
+            self.token_metrics_lbl.Wrap(600)
+
+    def _apply_visibility_defaults(self) -> None:
+        # Thinking visible by default
+        self._set_thinking_visible(True)
+        # Token metrics hidden by default
+        self._force_hide_token_metrics()
+        # Sync menu checks
+        menubar = self.GetMenuBar()
+        if menubar:
+            menubar.Check(int(self.menu_id_toggle_thinking), True)
+            menubar.Check(int(self.menu_id_toggle_tokens), False)
 
     def _build_menus(self) -> None:
         menubar = wx.MenuBar()
@@ -199,14 +297,28 @@ class MainFrame(wx.Frame):
         view_menu = wx.Menu()
         self.menu_id_copy_log = wx.NewIdRef()
         view_menu.Append(int(self.menu_id_copy_log), "Copy Conversation Log\tCtrl+C")
+        self.menu_id_clear_log = wx.NewIdRef()
+        view_menu.Append(int(self.menu_id_clear_log), "Clear Conversation Log")
+        self.menu_id_view_run_log = wx.NewIdRef()
+        view_menu.Append(int(self.menu_id_view_run_log), "View Run Log")
+        self.menu_id_toggle_thinking = wx.NewIdRef()
+        view_menu.AppendCheckItem(int(self.menu_id_toggle_thinking), "Show Full Token View (Thinking)")
+        view_menu.Check(int(self.menu_id_toggle_thinking), True)
+        self.menu_id_toggle_tokens = wx.NewIdRef()
+        view_menu.AppendCheckItem(int(self.menu_id_toggle_tokens), "Show Token Metrics")
+        view_menu.Check(int(self.menu_id_toggle_tokens), False)
         menubar.Append(view_menu, "&View")
 
         self.SetMenuBar(menubar)
 
         self.Bind(wx.EVT_MENU, self.on_new_conversation, id=int(self.menu_id_new_conversation))
         self.Bind(wx.EVT_MENU, self.on_copy_log, id=int(self.menu_id_copy_log))
+        self.Bind(wx.EVT_MENU, self.on_clear_log, id=int(self.menu_id_clear_log))
         self.Bind(wx.EVT_MENU, self.on_open_options, id=int(self.menu_id_options))
         self.Bind(wx.EVT_MENU, self.on_open_connection, id=int(self.menu_id_connection))
+        self.Bind(wx.EVT_MENU, self.on_view_run_log, id=int(self.menu_id_view_run_log))
+        self.Bind(wx.EVT_MENU, self.on_toggle_thinking, id=int(self.menu_id_toggle_thinking))
+        self.Bind(wx.EVT_MENU, self.on_toggle_tokens, id=int(self.menu_id_toggle_tokens))
         self.Bind(wx.EVT_MENU, lambda evt: self.history_panel.on_refresh(evt), id=int(self.menu_id_refresh_history))
         self.Bind(wx.EVT_MENU, lambda evt: self.history_panel.on_change_dir(evt), id=int(self.menu_id_change_dir))
         self.Bind(wx.EVT_MENU, lambda evt: self.history_panel.on_load_path(evt), id=int(self.menu_id_load_path))
@@ -234,7 +346,7 @@ class MainFrame(wx.Frame):
         self.Layout()
 
     def update_password_visibility(self) -> None:
-        if backend.is_remote():
+        if backend.is_remote() or backend.is_windows():
             self.hide_password_controls()
             self.save_pw_cb.SetValue(False)
             self.save_pw_cb.Enable(False)
@@ -255,9 +367,18 @@ class MainFrame(wx.Frame):
                 menubar.Enable(int(self.menu_id_clear_password), True)
                 menubar.Enable(int(self.menu_id_show_password), True)
 
+    def update_title(self) -> None:
+        mode_map = {
+            "windows": "Windows",
+            "wsl": "WSL",
+            "remote": "Remote",
+        }
+        label = mode_map.get(self.connection_mode, "Unknown")
+        self.SetTitle(f"{settings.APP_TITLE} ({label})")
+
     def _initialize_connection(self) -> None:
         settings_data = local_conf.get_connection_settings()
-        mode = settings_data.get("mode", "local")
+        mode = settings_data.get("mode", "windows")
         host = settings_data.get("host")
         port = int(settings_data.get("port", 22))
         username = settings_data.get("username", "root") or "root"
@@ -267,22 +388,37 @@ class MainFrame(wx.Frame):
             try:
                 backend.use_remote_backend(host=host, port=port, username=username, password=password or "")
                 self.connection_mode = "remote"
+                self.remote_password = password or ""
                 self.append_log(f"Configured remote backend: {username}@{host}:{port}")
                 self.hide_password_controls()
                 self.save_pw_cb.SetValue(False)
                 self.save_pw_cb.Enable(False)
             except Exception as exc:
                 backend.use_local_backend()
-                self.connection_mode = "local"
-                self.append_log(f"Failed to initialize remote backend ({exc}); using local WSL instead.")
+                self.connection_mode = "windows"
+                self.remote_password = None
+                self.append_log(f"Failed to initialize remote backend ({exc}); using local Windows instead.")
+        elif mode == "wsl":
+            try:
+                backend.use_wsl_backend()
+                self.connection_mode = "wsl"
+                self.remote_password = None
+                self.append_log("Configured local WSL backend.")
+            except Exception as exc:
+                backend.use_windows_backend()
+                self.connection_mode = "windows"
+                self.remote_password = None
+                self.append_log(f"Failed to initialize WSL ({exc}); using local Windows instead.")
         else:
-            backend.use_local_backend()
-            self.connection_mode = "local"
+            backend.use_windows_backend()
+            self.connection_mode = "windows"
+            self.remote_password = None
 
         self.SetStatusText(f"Ready ({backend.backend_description()})")
+        self.update_title()
 
     def load_saved_password(self) -> None:
-        if backend.is_remote():
+        if backend.is_remote() or backend.is_windows():
             self.pwd_tc.SetValue("")
             self.save_pw_cb.SetValue(False)
             self.hide_password_controls()
@@ -349,6 +485,11 @@ class MainFrame(wx.Frame):
         username: str,
         password: str,
     ) -> None:
+        # Clear fields for new connection context (apply to all modes)
+        self.clear_conversation_log()
+        self.clear_thinking()
+        self.set_task("Idle")
+
         if mode == "remote":
             try:
                 backend.use_remote_backend(host=host, port=port, username=username, password=password or "")
@@ -361,12 +502,32 @@ class MainFrame(wx.Frame):
                 return
             local_conf.save_connection_settings("remote", host, port, username, password)
             self.connection_mode = "remote"
+            self.remote_password = password or ""
             self.append_log(f"Switched to remote backend: {username}@{host}:{port}")
-        else:
-            backend.use_local_backend()
-            local_conf.save_connection_settings("local", host, port, username, password)
-            self.connection_mode = "local"
+            
+            # Skip remote OS detection for speed
+            self.SetStatusText(f"Ready ({backend.backend_description()})")
+
+        elif mode == "wsl":
+            try:
+                backend.use_wsl_backend()
+            except Exception as exc:
+                wx.MessageBox(
+                    f"WSL is not available:\n{exc}",
+                    "WSL Error",
+                    wx.ICON_ERROR | wx.OK,
+                )
+                return
+            local_conf.save_connection_settings("wsl", host, port, username, password)
+            self.connection_mode = "wsl"
+            self.remote_password = None
             self.append_log("Switched to local WSL backend.")
+        else:
+            backend.use_windows_backend()
+            local_conf.save_connection_settings("windows", host, port, username, password)
+            self.connection_mode = "windows"
+            self.remote_password = None
+            self.append_log("Switched to local Windows backend.")
 
         self.update_password_visibility()
         self.load_saved_password()
@@ -374,10 +535,16 @@ class MainFrame(wx.Frame):
         self.auto_start_scheduled = False
         self.schedule_auto_start()
         self.schedule_history_refresh()
+        self.update_title()
+        self.worker.q.put({"action": "update_conversation_directory", "password": password})
 
     def get_password(self) -> Optional[str]:
         if backend.is_remote():
-            return None
+            # Use the stored remote password (needed for sudo and remote pipeline tasks)
+            if self.remote_password:
+                return self.remote_password
+            # Fallback to config on disk if memory copy is missing
+            return local_conf.get_connection_settings().get("password") or None
         return self.pwd_tc.GetValue().strip() or None
 
     # Worker interactions -----------------------------------------
@@ -401,6 +568,8 @@ class MainFrame(wx.Frame):
                 self.SetStatusText(f"Idle ({backend.backend_description()})")
             else:
                 self.SetStatusText(text)
+            self.status_footer = text if text.lower() != "idle" else ""
+            self._render_thinking_text()
 
         wx.CallAfter(_)
 
@@ -408,33 +577,311 @@ class MainFrame(wx.Frame):
         text = "\n".join(self.conversation_log_lines)
         if text:
             text += "\n"
-        self.output_tc.SetValue(text)
-        self.output_tc.ShowPosition(self.output_tc.GetLastPosition())
+        self._set_text_preserve_view(self.output_tc, text)
 
     def _append_conversation_line(self, text: str) -> None:
         self.conversation_log_lines.append(text)
 
         def _():
-            self._render_conversation_log()
+            if wx.GetApp():
+                self._render_conversation_log()
 
-        wx.CallAfter(_)
+        if wx.GetApp():
+            wx.CallAfter(_)
+
+    def _prepend_conversation_line(self, text: str) -> None:
+        self.conversation_log_lines.insert(0, text)
+
+        def _():
+            if wx.GetApp():
+                self._render_conversation_log()
+
+        if wx.GetApp():
+            wx.CallAfter(_)
+
+    def _should_suppress_conversation_line(self, text: str) -> bool:
+        """Hide noisy plumbing lines from the user-facing log."""
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        lower = stripped.lower()
+        if stripped.startswith("[stderr]"):
+            return True
+        if stripped.startswith("[cmd]"):
+            return True
+        if stripped.startswith("Found ") and "history files" in stripped:
+            return True
+        if stripped.startswith("Started new conversation:"):
+            return True
+        if stripped.startswith("Conversation append failed"):
+            return True
+        if lower.startswith("tokens used"):
+            return True
+        return False
+
+    def _set_text_preserve_view(self, ctrl: wx.TextCtrl, text: str) -> None:
+        """Update text without yanking the user's scroll position."""
+        try:
+            caret = ctrl.GetInsertionPoint()
+            vpos = ctrl.GetScrollPos(wx.VERTICAL)
+            hpos = ctrl.GetScrollPos(wx.HORIZONTAL)
+            last = ctrl.GetLastPosition()
+        except Exception:
+            ctrl.SetValue(text)
+            return
+        ctrl.Freeze()
+        ctrl.SetValue(text)
+        try:
+            caret = min(caret, ctrl.GetLastPosition())
+            ctrl.SetInsertionPoint(caret)
+            # Restore scroll offsets to avoid jump
+            try:
+                if last == 0:
+                    return
+                ctrl.ScrollLines(vpos - ctrl.GetScrollPos(wx.VERTICAL))
+                ctrl.SetScrollPos(wx.HORIZONTAL, hpos, refresh=False)
+            except Exception:
+                pass
+        finally:
+            ctrl.Thaw()
+
+    def _safe_set_text_preserve_view(self, ctrl: wx.TextCtrl, text: str, scroll_to_end: bool = False) -> None:
+        """Safer variant to guard against screen-reader/driver quirks."""
+        try:
+            self._set_text_preserve_view(ctrl, text)
+            if scroll_to_end:
+                try:
+                    ctrl.ShowPosition(ctrl.GetLastPosition())
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                ctrl.SetValue(text)
+            except Exception:
+                pass
+
+    def _set_token_metrics_visible(self, show: bool) -> None:
+        self.show_tokens = bool(show)
+        panel = getattr(self, "token_metrics_panel", None)
+        
+        # Layout where metrics should appear (above prompt)
+        # We need to find the bottom_controls_sizer.
+        # In __init__, we added bottom_controls_sizer to self.chat_panel.GetSizer() as the last item.
+        main_sizer = self.chat_panel.GetSizer() if hasattr(self, "chat_panel") else None
+        if not main_sizer:
+            return
+            
+        # The bottom controls are the last item in the vertical main_sizer
+        try:
+            bottom_item = main_sizer.GetItem(main_sizer.GetItemCount() - 1)
+            bottom_sizer = bottom_item.GetSizer() if bottom_item else None
+        except Exception:
+            bottom_sizer = None
+
+        if not bottom_sizer:
+            # Fallback if layout is unexpected
+            return
+
+        def ensure_panel_exists() -> wx.Panel:
+            if getattr(self, "token_metrics_panel", None):
+                return self.token_metrics_panel
+            # Recreate panel and label
+            pnl = NoFocusPanel(self.chat_panel)
+            sizer = wx.BoxSizer(wx.VERTICAL)
+            self.token_metrics_lbl = wx.StaticText(
+                pnl, label="Tokens used: 0   Remaining: 0 (0.0% left)"
+            )
+            self.token_metrics_lbl.SetName("Token metrics")
+            self.token_metrics_lbl.Wrap(600)
+            sizer.Add(self.token_metrics_lbl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+            pnl.SetSizer(sizer)
+            self.token_metrics_panel = pnl
+            return pnl
+
+        if not show:
+            self._force_hide_token_metrics()
+        else:
+            panel = ensure_panel_exists()
+            # Insert at top of bottom_sizer (index 0)
+            # Check if it's already there
+            is_in_sizer = False
+            for child in bottom_sizer.GetChildren():
+                if child.GetWindow() == panel:
+                    is_in_sizer = True
+                    break
+            
+            if not is_in_sizer:
+                bottom_sizer.Insert(0, panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 0)
+            
+            panel.Show()
+            panel.Enable()
+            if self.token_metrics_lbl:
+                self.token_metrics_lbl.Wrap(600)
+            self.chat_panel.Layout()
+
+        try:
+            self.history_panel.set_metrics_visible(show)
+            if show and self.token_metrics_lbl:
+                self.history_panel.update_metrics(self.token_metrics_lbl.GetLabel())
+        except Exception:
+            pass
+
+    def _force_hide_token_metrics(self) -> None:
+        """Hide token metrics in both chat panel and history panel, and keep them out of tab order."""
+        self.show_tokens = False
+        panel = getattr(self, "token_metrics_panel", None)
+
+        # Remove from chat bottom sizer if present
+        main_sizer = self.chat_panel.GetSizer() if hasattr(self, "chat_panel") else None
+        if main_sizer:
+            try:
+                bottom_item = main_sizer.GetItem(main_sizer.GetItemCount() - 1)
+                bottom_sizer = bottom_item.GetSizer() if bottom_item else None
+            except Exception:
+                bottom_sizer = None
+            if bottom_sizer and panel:
+                try:
+                    bottom_sizer.Detach(panel)
+                except Exception:
+                    pass
+        if panel:
+            try:
+                panel.Hide()
+                panel.Disable()
+                panel.Destroy()
+            except Exception:
+                pass
+            self.token_metrics_panel = None
+            self.token_metrics_lbl = None
+
+        # Hide history metrics label
+        try:
+            self.history_panel.set_metrics_visible(False)
+            # Also clear the label so screen readers won't announce lingering text
+            self.history_panel.metrics_label.SetLabel("")
+            self.history_panel.metrics_label.Hide()
+            self.history_panel.metrics_in_sizer = False
+        except Exception:
+            pass
+
+        try:
+            self.chat_panel.Layout()
+        except Exception:
+            pass
+
+    def _set_thinking_visible(self, show: bool) -> None:
+        self.show_thinking = bool(show)
+        # Manage Notebook pages
+        if not hasattr(self, "notebook"):
+            return
+            
+        # Check if Thinking page is present
+        page_count = self.notebook.GetPageCount()
+        thinking_page_index = -1
+        for i in range(page_count):
+            if self.notebook.GetPageText(i) == "Thinking":
+                thinking_page_index = i
+                break
+        
+        if show:
+            if thinking_page_index == -1:
+                # Add it back
+                self.notebook.AddPage(self.thinking_tab, "Thinking")
+        else:
+            if thinking_page_index != -1:
+                # Remove it (but don't destroy the window, just remove from notebook)
+                self.notebook.RemovePage(thinking_page_index)
+
+    def _render_thinking_text(self) -> None:
+        body = "\n\n".join(self.thinking_history).strip()
+        footer = f"Status: {self.status_footer}" if self.status_footer else ""
+        parts = [p for p in (body, footer) if p]
+        combined = "\n\n".join(parts)
+        if combined:
+            combined += "\n"
+        self._safe_set_text_preserve_view(self.thinking_tc, combined)
+
+    def reset_live_activity(self) -> None:
+        self.live_activity_raw = []
+        self.live_activity_pending = False
+        def _():
+            self.live_activity_tc.SetValue("")
+        if wx.GetApp():
+            wx.CallAfter(_)
+
+    def append_live_activity_raw(self, chunk: str) -> None:
+        """Append raw stdout/stderr chunks to the live activity box without filtering."""
+        if chunk is None:
+            return
+        if isinstance(chunk, bytes):
+            try:
+                chunk = chunk.decode("utf-8", errors="replace")
+            except Exception:
+                return
+        if not chunk:
+            return
+        # Split into lines and keep even blank lines to preserve shape
+        lines = chunk.splitlines()
+        if not lines:
+            return
+
+        self.live_activity_raw.extend(lines)
+        # Keep a rolling buffer
+        if len(self.live_activity_raw) > 600:
+            self.live_activity_raw = self.live_activity_raw[-600:]
+
+        # Throttle UI updates to reduce screen reader load.
+        def _flush():
+            tail = self.live_activity_raw[-10:]
+            text = "\n".join(tail)
+            self._safe_set_text_preserve_view(self.live_activity_tc, text, scroll_to_end=True)
+
+        if wx.GetApp():
+            def _schedule():
+                # Coalesce updates: restart a one-shot CallLater at 300ms
+                if self.live_activity_calllater is None:
+                    self.live_activity_calllater = wx.CallLater(300, _flush)
+                else:
+                    try:
+                        self.live_activity_calllater.Start(300, oneShot=True)
+                    except Exception:
+                        # Fallback: recreate
+                        self.live_activity_calllater = wx.CallLater(300, _flush)
+            wx.CallAfter(_schedule)
 
     def clear_conversation_log(self) -> None:
         self.conversation_log_lines = []
 
         def _():
-            self._render_conversation_log()
+            if wx.GetApp():
+                self._render_conversation_log()
 
-        wx.CallAfter(_)
+        if wx.GetApp():
+            wx.CallAfter(_)
 
     def append_log(self, text: str) -> None:
         if not text:
             return
+        if self._should_suppress_conversation_line(text):
+            self._maybe_update_tokens(text)
+            return
         self._append_conversation_line(text)
+        self._maybe_update_tokens(text)
+
+    def prepend_log(self, text: str) -> None:
+        if not text:
+            return
+        if self._should_suppress_conversation_line(text):
+            self._maybe_update_tokens(text)
+            return
+        self._prepend_conversation_line(text)
         self._maybe_update_tokens(text)
 
     def append_worker_log(self, text: str) -> None:
         if not text:
+            return
+        if self._should_suppress_conversation_line(text):
+            self._maybe_update_tokens(text)
             return
         self._append_conversation_line(text)
         self._maybe_update_tokens(text)
@@ -448,17 +895,18 @@ class MainFrame(wx.Frame):
 
         def _():
             self.thinking_history.append(clean)
-            rendered = "\n\n".join(self.thinking_history) + "\n"
-            self.thinking_tc.SetValue(rendered)
-            self.thinking_tc.ShowPosition(self.thinking_tc.GetLastPosition())
+            self._render_thinking_text()
 
-        wx.CallAfter(_)
+        if wx.GetApp():
+            wx.CallAfter(_)
         self._maybe_update_tokens(clean)
 
     def begin_run_log(self) -> None:
         def _():
             self.current_run_log_chunks = []
-            self.view_run_log_btn.Enable(False)
+            self.last_run_log = ""
+            self.status_footer = "Running..."
+            self._render_thinking_text()
 
         wx.CallAfter(_)
 
@@ -475,7 +923,8 @@ class MainFrame(wx.Frame):
         def _():
             text = "".join(self.current_run_log_chunks)
             self.last_run_log = text
-            self.view_run_log_btn.Enable(bool(text.strip()))
+            self.status_footer = "Idle" if success else "Completed with errors"
+            self._render_thinking_text()
 
         wx.CallAfter(_)
 
@@ -485,44 +934,68 @@ class MainFrame(wx.Frame):
         if not path:
             return path
         base = self.conversation_dir or ""
-        if base and path.startswith(base.rstrip("/") + "/"):
-            rel = path[len(base.rstrip("/")) + 1 :]
+        normalized_path = path.replace("\\", "/")
+        normalized_base = base.replace("\\", "/")
+        if normalized_base and normalized_path.startswith(normalized_base.rstrip("/") + "/"):
+            rel = normalized_path[len(normalized_base.rstrip("/")) + 1 :]
             return rel or path
-        if path.startswith("/root/.codex/"):
-            return path[len("/root/.codex/") :]
+        if normalized_path.startswith("/root/.codex/"):
+            return normalized_path[len("/root/.codex/") :]
+        win_default = settings.DEFAULT_WINDOWS_CONVERSATION_DIR.replace("\\", "/")
+        if normalized_path.startswith(win_default.rstrip("/") + "/"):
+            rel = normalized_path[len(win_default.rstrip("/")) + 1 :]
+            return rel or path
         return path
 
     def get_conversation_dir(self) -> Optional[str]:
         return self.conversation_dir
 
     def set_conversation_dir(self, path: Optional[str]) -> None:
-        old = self.conversation_dir
-        normalized = (path or "").strip() or None
-        if normalized == old:
-            self.history_panel.set_directory_label(path or "")
+        def _():
+            old = self.conversation_dir
+            normalized = (path or "").strip() or None
+            if normalized == old:
+                self.history_panel.set_directory_label(path or "")
+                self.schedule_history_refresh()
+                return
+            self.conversation_dir = normalized
+            self.history_panel.set_directory_label(self.conversation_dir or "")
+            self.clear_thinking()
+            self.current_conversation_path = None
+            self.tokens_used = 0
+            self.tokens_remaining = self.token_budget if self.token_budget > 0 else None
+            self.update_token_metrics()
+            if self.conversation_dir:
+                self.append_log(f"Conversation directory set to: {self.conversation_dir}")
+            else:
+                self.append_log("Conversation directory cleared.")
             self.schedule_history_refresh()
-            return
-        self.conversation_dir = normalized
-        self.history_panel.set_directory_label(self.conversation_dir or "")
-        self.clear_thinking()
-        self.current_conversation_path = None
-        self.tokens_used = 0
-        self.tokens_remaining = self.token_budget if self.token_budget > 0 else None
-        self.update_token_metrics()
-        if self.conversation_dir:
-            self.append_log(f"Conversation directory set to: {self.conversation_dir}")
-        else:
-            self.append_log("Conversation directory cleared.")
-        self.schedule_history_refresh()
+        
+        wx.CallAfter(_)
 
     def set_current_conversation(self, path: Optional[str]) -> None:
         self.current_conversation_path = path
+        if path:
+            # Check if it's a default-named conversation
+            filename = Path(path).name
+            # Pattern for "conversation_YYYYMMDDTHHMMSS.md" or "conversation_YYYYMMDDTHHMMSS_N.md"
+            if re.match(r"conversation_\d{8}T\d{6}(_\d+)?\.md", filename):
+                self.conversation_has_been_labeled = False
+            else:
+                self.conversation_has_been_labeled = True
+        else:
+            self.conversation_has_been_labeled = False
 
     def set_options_from_toml(self, toml_text: str) -> None:
         def _():
             self.last_options_toml = toml_text
             if self.options_dialog and self.options_dialog.IsShown():
                 self.options_dialog.set_from_toml(toml_text)
+            try:
+                # Update cached auto-update flag from settings (may be mutated by worker)
+                self.auto_update_codex = getattr(settings, "DEFAULT_AUTO_UPDATE_CODEX", True)
+            except Exception:
+                pass
 
         wx.CallAfter(_)
 
@@ -541,9 +1014,8 @@ class MainFrame(wx.Frame):
             self.tokens_used = 0
             self.tokens_remaining = self.token_budget if self.token_budget > 0 else None
             self.update_token_metrics()
-            label = self.history_label(path)
-            self.append_log(f"Started new conversation: {label}")
             self.schedule_history_refresh()
+            self.conversation_has_been_labeled = False # Reset flag for new conversation
             pw = self.get_password()
             self.worker.q.put({"action": "open_history", "password": pw if pw else None, "path": path})
 
@@ -567,10 +1039,17 @@ class MainFrame(wx.Frame):
                 clean = normalize_thinking_text(initial_text)
                 if clean:
                     self.thinking_history.append(clean)
-                    self.thinking_tc.SetValue(clean + "\n")
-                    self.thinking_tc.ShowPosition(self.thinking_tc.GetLastPosition())
+            self._render_thinking_text()
 
         wx.CallAfter(_)
+
+    def on_toggle_thinking(self, evt) -> None:
+        checked = evt.IsChecked() if evt is not None else True
+        self._set_thinking_visible(checked)
+
+    def on_toggle_tokens(self, evt) -> None:
+        checked = evt.IsChecked()
+        self._set_token_metrics_visible(checked)
 
     # Token metrics ------------------------------------------------
 
@@ -578,6 +1057,9 @@ class MainFrame(wx.Frame):
         if not text:
             return
         updated = False
+        normalized = text
+        if normalized.lower().startswith("[stderr]"):
+            normalized = normalized[len("[stderr]") :].lstrip()
 
         def _update_used(value: int) -> bool:
             if value < 0:
@@ -593,7 +1075,7 @@ class MainFrame(wx.Frame):
 
         used_updated = False
 
-        match = re.search(r"tokens\s+used:\s*([0-9,]+)", text, re.IGNORECASE)
+        match = re.search(r"tokens?\s+used[:\s-]*([0-9,]+)", normalized, re.IGNORECASE)
         if match:
             try:
                 used = int(match.group(1).replace(",", ""))
@@ -603,7 +1085,7 @@ class MainFrame(wx.Frame):
                 used_updated = True
 
         if not used_updated:
-            usage_match = re.search(r"token\s+usage[^:]*:\s*(.*)", text, re.IGNORECASE)
+            usage_match = re.search(r"token\s+usage[^:]*:\s*(.*)", normalized, re.IGNORECASE)
             if usage_match:
                 payload = usage_match.group(1)
                 total_match = re.search(r"total\s*(?:tokens?)?\s*=?\s*([0-9,]+)", payload, re.IGNORECASE)
@@ -623,7 +1105,7 @@ class MainFrame(wx.Frame):
                         used_updated = True
 
         if not used_updated:
-            total_only = re.search(r"total\s+tokens?:\s*([0-9,]+)", text, re.IGNORECASE)
+            total_only = re.search(r"total\s+tokens?:\s*([0-9,]+)", normalized, re.IGNORECASE)
             if total_only:
                 try:
                     used = int(total_only.group(1).replace(",", ""))
@@ -632,11 +1114,11 @@ class MainFrame(wx.Frame):
                 if _update_used(used):
                     used_updated = True
 
-        text_lower = text.lower()
+        text_lower = normalized.lower()
         if "context" in text_lower or "ctx" in text_lower:
             rem_match = re.search(
                 r"(?:context\s*(?:remaining|left|available)|(?:remaining|left)\s*(?:context|tokens?))[\s:=-]*([0-9][0-9,]*)",
-                text,
+                normalized,
                 re.IGNORECASE,
             )
             if rem_match:
@@ -646,7 +1128,7 @@ class MainFrame(wx.Frame):
                     remaining = -1
                 if remaining >= 0:
                     self.tokens_remaining = remaining
-                    tail = text[rem_match.end() :]
+                    tail = normalized[rem_match.end() :]
                     pct_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", tail)
                     estimate = None
                     if pct_match:
@@ -690,11 +1172,22 @@ class MainFrame(wx.Frame):
         else:
             text = f"Tokens used: {self.tokens_used:,}"
 
+        if not self.show_tokens:
+            # Ensure both chat panel and history panel metrics stay hidden and out of tab order
+            self._force_hide_token_metrics()
+            return
+
         def _update_labels():
             if getattr(self, "token_metrics_lbl", None):
                 self.token_metrics_lbl.SetLabel(text)
                 self.token_metrics_lbl.Wrap(600)
             self.history_panel.update_metrics(text)
+            if not self.show_tokens:
+                # Ensure hidden state stays enforced even if downstream calls try to show it.
+                try:
+                    self._set_token_metrics_visible(False)
+                except Exception:
+                    pass
 
         wx.CallAfter(_update_labels)
 
@@ -737,7 +1230,6 @@ class MainFrame(wx.Frame):
             self.append_log("No prompt provided.")
             return
         pw = self.get_password()
-        self.append_log(f"> {prompt}")
         self.worker.q.put(
             {
                 "action": "run_cmd",
@@ -747,7 +1239,7 @@ class MainFrame(wx.Frame):
                 "conversation_dir": self.conversation_dir,
             }
         )
-        self.cmd_tc.Clear()
+        # Keep prompt text so the user can review/edit after sending
         self.cmd_tc.SetFocus()
 
     def on_copy_log(self, _evt) -> None:
@@ -758,6 +1250,14 @@ class MainFrame(wx.Frame):
             self.SetStatusText("Output copied to clipboard.")
         else:
             self.SetStatusText("Clipboard not available.")
+
+    def on_clear_log(self, _evt) -> None:
+        self.clear_conversation_log()
+        self.SetStatusText("Conversation log cleared.")
+
+    def on_clear_thinking(self, _evt) -> None:
+        self.clear_thinking()
+        self.SetStatusText("Thinking log cleared.")
 
     def on_new_conversation(self, _evt) -> None:
         pw = self.get_password()

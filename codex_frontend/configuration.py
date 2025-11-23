@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
+from pathlib import Path
 
 from . import settings, backend
 
@@ -12,10 +13,16 @@ def build_config_toml(
     sandbox_mode: str,
     web_search: bool,
     trust_paths: List[str],
+    intelligence: Optional[str] = None,
+    reasoning_level: Optional[str] = None,
 ) -> str:
     lines = []
     if model:
         lines.append(f'model = "{model}"')
+    if intelligence:
+        lines.append(f'intelligence = "{intelligence}"')
+    if reasoning_level:
+        lines.append(f'reasoning_level = "{reasoning_level}"')
     lines.append(f'approval_policy = "{approval_policy}"')
     lines.append(f'sandbox_mode = "{sandbox_mode}"')
     if web_search:
@@ -40,8 +47,32 @@ def apply_config_as_root(
     sandbox_mode: str,
     web_search: bool,
     trust_paths: List[str],
+    intelligence: Optional[str] = None,
+    reasoning_level: Optional[str] = None,
 ) -> Tuple[bool, str]:
-    content = build_config_toml(model, approval_policy, sandbox_mode, web_search, trust_paths)
+    # Windows backend: write directly to %USERPROFILE%\.codex
+    if backend.is_windows():
+        try:
+            cfg_dir = Path.home() / ".codex"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            path = cfg_dir / "config.toml"
+            content = build_config_toml(
+                model, approval_policy, sandbox_mode, web_search, trust_paths, intelligence, reasoning_level
+            )
+            path.write_text(content, encoding="utf-8")
+            return True, f"config.toml written to {path}"
+        except Exception as exc:
+            return False, f"failed to write config.toml: {exc}"
+
+    content = build_config_toml(
+        model,
+        approval_policy,
+        sandbox_mode,
+        web_search,
+        trust_paths,
+        intelligence,
+        reasoning_level,
+    )
     cmd = (
         "install -m 700 -d ~/.codex && "
         "cat > ~/.codex/config.toml <<'EOF'\n"
@@ -56,6 +87,14 @@ def apply_config_as_root(
 
 
 def read_config_as_root(password: Optional[str]) -> str:
+    if backend.is_windows():
+        path = Path.home() / ".codex" / "config.toml"
+        try:
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+            return "no config"
+        except Exception as exc:
+            return f"no config ({exc})"
     result = backend.run_as_root(
         "test -f ~/.codex/config.toml && cat ~/.codex/config.toml || echo 'no config'",
         password,

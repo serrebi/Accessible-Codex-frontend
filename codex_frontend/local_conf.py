@@ -84,7 +84,7 @@ def get_connection_settings() -> Dict[str, Any]:
             except Exception:
                 decoded_pw = None
     return {
-        "mode": data.get("mode", "local"),
+        "mode": data.get("mode", "windows"),
         "host": remote.get("host", ""),
         "port": int(remote.get("port", 22)),
         "username": remote.get("username", "root"),

@@ -8,12 +8,16 @@ import wx
 
 class ConnectionDialog(wx.Dialog):
     def __init__(self, parent: wx.Window, initial: Dict[str, Any]):
-        super().__init__(parent, title="Connection Settings", size=(420, 320))
+        super().__init__(parent, title="Connection Settings", size=(440, 340))
 
-        modes = ["Local WSL", "Remote SSH"]
+        modes = ["Local Windows (default)", "Local WSL", "Remote SSH"]
         self.mode_choices = modes
-        current_mode = initial.get("mode", "local")
-        selection = 0 if current_mode != "remote" else 1
+        current_mode = initial.get("mode", "windows")
+        selection = 0
+        if current_mode == "wsl":
+            selection = 1
+        elif current_mode == "remote":
+            selection = 2
 
         self.mode_radio = wx.RadioBox(self, label="Backend", choices=modes, majorDimension=1, style=wx.RA_SPECIFY_ROWS)
         self.mode_radio.SetSelection(selection)
@@ -47,12 +51,19 @@ class ConnectionDialog(wx.Dialog):
         self._on_mode_change(None)
 
     def _on_mode_change(self, _evt):
-        is_remote = self.mode_radio.GetSelection() == 1
+        sel = self.mode_radio.GetSelection()
+        is_remote = sel == 2
         for widget in (self.host_txt, self.port_txt, self.user_txt, self.pass_txt):
             widget.Enable(is_remote)
 
     def get_values(self) -> Dict[str, Any]:
-        mode = "remote" if self.mode_radio.GetSelection() == 1 else "local"
+        sel = self.mode_radio.GetSelection()
+        if sel == 0:
+            mode = "windows"
+        elif sel == 1:
+            mode = "wsl"
+        else:
+            mode = "remote"
         return {
             "mode": mode,
             "host": self.host_txt.GetValue().strip(),
